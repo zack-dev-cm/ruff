@@ -18,7 +18,7 @@ use crate::types::{
     class::walk_generic_alias,
     cyclic::{ActiveRecursionDetector, TypeIdentity},
     function::{FunctionType, walk_function_type},
-    generics::walk_specialization_types,
+    generics::{Specialization, walk_specialization_types},
     instance::{walk_nominal_instance_type, walk_protocol_instance_type},
     known_instance::walk_known_instance_type,
     method::{walk_bound_method_type, walk_method_wrapper_type},
@@ -30,6 +30,7 @@ use crate::types::{
     type_form::walk_typeform_type,
     typed_dict::walk_typed_dict_type,
     typevar::{TypeVarInstance, walk_bound_type_var_type, walk_type_var_type},
+    variance::{TypeVarVariance, VarianceInferable},
     walk_property_instance_type, walk_typeguard_type, walk_typeis_type,
 };
 
@@ -790,6 +791,8 @@ enum TypeSearchMode {
     IncludeLazyAttributes,
     /// Visit alias arguments without evaluating alias bodies or other lazy attributes.
     IncludeAliasArguments,
+    /// Follow alias values, using their parameters to close recursive visits.
+    IncludeAliasValues,
 }
 
 impl TypeSearchMode {
@@ -818,8 +821,40 @@ where
         env: &'a ProgramEnvironment<'db>,
         query: &'a dyn Fn(Type<'db>) -> U,
         recursion_guard: TypeCollector<'db>,
+        active_aliases: ActiveRecursionDetector<Definition<'db>>,
         found_matching_type: Cell<U>,
         mode: TypeSearchMode,
+    }
+
+    impl<'db, U> AnyOverTypeVisitor<'db, '_, U>
+    where
+        U: Copy + Default + PartialEq,
+    {
+        /// Close an alias backedge without expanding a growing specialization. Bivariant
+        /// parameters cannot contribute a match, even when their stored arguments contain one.
+        fn visit_alias_arguments(
+            &self,
+            db: &'db dyn Db,
+            constructor: Type<'db>,
+            arguments: Option<Specialization<'db>>,
+        ) {
+            let Some(arguments) = arguments else {
+                return;
+            };
+            for (typevar, argument) in arguments
+                .generic_context(db)
+                .variables(db)
+                .zip(arguments.types(db))
+            {
+                if constructor
+                    .variance_of(db, self.env, typevar.identity(db))
+                    .evaluate(db)
+                    != TypeVarVariance::Bivariant
+                {
+                    self.visit_type(db, *argument);
+                }
+            }
+        }
     }
 
     impl<'db, U> TypeVisitor<'db> for AnyOverTypeVisitor<'db, '_, U>
@@ -862,12 +897,51 @@ where
             }
             walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard);
         }
+
+        fn visit_type_alias_type(&self, db: &'db dyn Db, alias: TypeAliasType<'db>) {
+            if matches!(self.mode, TypeSearchMode::IncludeAliasValues) {
+                self.active_aliases.visit(
+                    &alias.definition(db),
+                    || {
+                        self.visit_alias_arguments(
+                            db,
+                            Type::TypeAlias(alias.unspecialized(db)),
+                            alias.specialization(db),
+                        );
+                    },
+                    || self.visit_type(db, alias.value_type(db)),
+                );
+            } else {
+                walk_type_alias_type(db, alias, self);
+            }
+        }
+
+        fn visit_recursive_type(&self, db: &'db dyn Db, recursive: RecursiveType<'db>) {
+            if matches!(self.mode, TypeSearchMode::IncludeAliasValues) {
+                self.active_aliases.visit(
+                    &recursive.definition(db),
+                    || {
+                        self.visit_alias_arguments(
+                            db,
+                            Type::Recursive(recursive.constructor(db)),
+                            recursive.arguments(db),
+                        );
+                    },
+                    || self.visit_type(db, recursive.unfold(db, self.env).into_type()),
+                );
+            } else if self.should_visit_lazy_type_attributes() {
+                self.visit_type(db, recursive.unfold(db, self.env).into_type());
+            } else {
+                self.notify_skipped_lazy_type_attributes();
+            }
+        }
     }
 
     let visitor = AnyOverTypeVisitor {
         env,
         query: &query,
         recursion_guard: TypeCollector::default(),
+        active_aliases: ActiveRecursionDetector::default(),
         found_matching_type: Cell::default(),
         mode,
     };
@@ -909,6 +983,18 @@ pub(super) fn any_over_type_including_alias_arguments<'db>(
     query: impl Fn(Type<'db>) -> bool,
 ) -> bool {
     any_over_type_impl(db, env, ty, TypeSearchMode::IncludeAliasArguments, query)
+}
+
+/// Searches alias values without forcing other lazy attributes.
+/// For `type Constant[T] = int`, `Constant[T]` does not contain a semantic occurrence of `T`.
+/// Recursive backedges visit only arguments that contribute to the constructor's value.
+pub(super) fn any_over_type_with_alias_values<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    query: impl Fn(Type<'db>) -> bool,
+) -> bool {
+    any_over_type_impl(db, env, ty, TypeSearchMode::IncludeAliasValues, query)
 }
 
 /// Searches through type aliases without forcing other lazily inferred type attributes.

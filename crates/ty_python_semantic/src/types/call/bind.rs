@@ -67,7 +67,7 @@ use crate::types::typevar::{BoundTypeVarIdentity, TypeVarNonceGenerator, TypeVar
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
     TypeCollector, TypeKind, TypeVisitor, any_over_type, any_over_type_including_alias_arguments,
-    walk_non_atomic_type, walk_type_with_recursion_guard,
+    any_over_type_with_alias_values, walk_non_atomic_type, walk_type_with_recursion_guard,
 };
 use crate::types::{
     BindingContext, BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral, CycleDetector,
@@ -6325,6 +6325,8 @@ impl<'db> CallInference<'_, 'db> {
             .argument_relations()
             .filter_map(|relation| {
                 let markers = RefCell::new(FxOrderSet::default());
+                // Find candidate markers without evaluating alias bodies for ordinary calls.
+                // The specialization below checks whether they occur in the alias's value.
                 any_over_type_including_alias_arguments(
                     db,
                     self.env,
@@ -6355,7 +6357,7 @@ impl<'db> CallInference<'_, 'db> {
                     self.env,
                     elements.iter().copied().map(|element| {
                         let markers = RefCell::new(FxOrderSet::default());
-                        any_over_type_including_alias_arguments(db, self.env, element, |ty| {
+                        any_over_type_with_alias_values(db, self.env, element, |ty| {
                             if let Some(pending) = ty.as_pending_inference()
                                 && pending.typevar(db) == typevar
                                 && pending.call_site(db) == call_site
@@ -6388,7 +6390,7 @@ impl<'db> CallInference<'_, 'db> {
             let arguments: Vec<_> = pending
                 .iter()
                 .filter(|(declared_type, _)| {
-                    any_over_type_including_alias_arguments(db, self.env, *declared_type, |ty| {
+                    any_over_type_with_alias_values(db, self.env, *declared_type, |ty| {
                         ty == Type::TypeVar(typevar)
                     })
                 })

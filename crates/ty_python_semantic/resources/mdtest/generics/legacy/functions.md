@@ -3134,6 +3134,128 @@ def repeat(flag: bool):
         value = grow(value)  # error: [possibly-unresolved-reference]
 ```
 
+## Recursive calls with unused alias parameters
+
+`Constant[T]` is always `int`. Its unused argument does not make the inferred element type depend on
+itself, so the second tuple element also converges to `int`.
+
+```py
+from typing_extensions import TypeAliasType, TypeVar
+
+T = TypeVar("T")
+Constant = TypeAliasType("Constant", int, type_params=(T,))
+
+def advance(value: tuple[T, object]) -> tuple[Constant[T], T]:
+    return (1, value[0])
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    reveal_type(value[1])  # revealed: int
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive calls with nested constant aliases
+
+An unused parameter remains irrelevant when its alias is nested inside another alias and a
+container.
+
+```py
+from typing_extensions import TypeAliasType, TypeVar
+
+T = TypeVar("T")
+Constant = TypeAliasType("Constant", int, type_params=(T,))
+Nested = TypeAliasType("Nested", list[Constant[T]], type_params=(T,))
+
+def advance(value: tuple[T, object]) -> tuple[Nested[T], T]:
+    return ([1], value[0])
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    reveal_type(value[1][0])  # revealed: int
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive calls with simplified alias values
+
+Specialization can remove a dependency even when the alias uses both parameters. `Either[object, T]`
+is `object`, regardless of the unresolved `T`.
+
+```py
+from typing_extensions import TypeAliasType, TypeVar
+
+A = TypeVar("A")
+B = TypeVar("B")
+T = TypeVar("T")
+Either = TypeAliasType("Either", A | B, type_params=(A, B))
+
+def advance(value: tuple[T, object]) -> tuple[Either[object, T], T]:
+    return (1, value[0])
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    reveal_type(value[1])  # revealed: object
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Unresolved arguments through recursive aliases
+
+A recursive alias still retains dependencies on parameters used in its value. Repeated calls keep
+the unresolved list element provisional while preserving the list itself.
+
+```py
+from typing import TypeAlias, TypeVar
+
+T = TypeVar("T")
+Box: TypeAlias = tuple[T, "Box[T] | None"]
+
+def grow(value: Box[T]) -> Box[list[T]]:
+    return ([value[0]], None)
+
+def repeat(flag: bool):
+    while flag:
+        value = grow(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    reveal_type(value[0])  # revealed: list[Divergent]
+    # error: [possibly-unresolved-reference]
+    wrong: int = value[0]  # error: [invalid-assignment]
+```
+
+## Pending arguments in growing recursive aliases
+
+A parameter can contribute through recursive children even when it is absent from the root's
+payload. The recursive specializations swap parameters and add sequence layers, while the root's
+integer payload remains known.
+
+```py
+from collections.abc import Sequence
+from typing import TypeAlias, TypeVar
+
+A = TypeVar("A")
+B = TypeVar("B")
+T = TypeVar("T")
+Tree: TypeAlias = tuple[A, Sequence["Tree[Sequence[B], A]"]]
+
+def grow(value: tuple[T, object]) -> tuple[Tree[int, T], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = grow(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    reveal_type(value[0][0])  # revealed: int
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[0][0]  # error: [invalid-assignment]
+```
+
 ## Recursive calls with type parameter defaults
 
 A declared default remains available when the recursive argument provides no binding. The default

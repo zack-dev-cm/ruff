@@ -509,9 +509,33 @@ impl<'db> RecursiveType<'db> {
         typevar: BoundTypeVarIdentity<'db>,
     ) -> VarianceTerm<'db> {
         let env = self.environment(db);
-        self.unfold(db, &env)
-            .map(|unfolded| unfolded.variance_of(db, &env, typevar))
-            .unwrap_or(VarianceTerm::BIVARIANT)
+        let constructor = self.constructor(db);
+        let Some(body) = constructor.unfold(db, &env).into_unfolded() else {
+            return VarianceTerm::BIVARIANT;
+        };
+        let Some(arguments) = self.arguments(db) else {
+            return body.variance_of(db, &env, typevar);
+        };
+        let parameters = arguments.generic_context(db);
+        if parameters
+            .variables(db)
+            .any(|parameter| parameter.identity(db) == typevar)
+        {
+            return body.variance_of(db, &env, typevar);
+        }
+
+        // Measure each formal parameter once, then compose with the applied arguments. Unfolding
+        // specialized bodies here would keep creating new equations for `Tree[list[T]]`.
+        VarianceTerm::join(
+            db,
+            parameters
+                .variables(db)
+                .zip(arguments.types(db))
+                .map(|(parameter, argument)| {
+                    body.variance_of(db, &env, parameter.identity(db))
+                        .compose_thunk(db, || argument.variance_of(db, &env, typevar))
+                }),
+        )
     }
 }
 
