@@ -2187,4 +2187,99 @@ static_assert(is_assignable_to(ClassContainer[object], ClassContainer[int]))
 static_assert(not is_assignable_to(ClassContainer[int], ClassContainer[object]))
 ```
 
+## Recursive aliases with invariant argument transformations
+
+A recursive alias can introduce invariant occurrences below its first layer. The mutable lists in
+`Tree[list[T]]` make the producer invariant even though the root payload only produces `T`.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Generic, TypeAlias, TypeVar
+from ty_extensions import static_assert
+from ty_extensions._internal import is_subtype_of
+
+T = TypeVar("T")
+Tree: TypeAlias = tuple[T, "Tree[list[T]] | None"]
+
+V = TypeVar("V", infer_variance=True)
+
+class Producer(Generic[V]):
+    def get(self) -> Tree[V]:
+        raise NotImplementedError
+
+static_assert(not is_subtype_of(Producer[int], Producer[object]))
+static_assert(not is_subtype_of(Producer[object], Producer[int]))
+
+def widen(value: Producer[int]) -> Producer[object]:
+    return value  # error: [invalid-return-type]
+```
+
+## Recursive aliases with permuted parameters
+
+Swapping parameters at a recursive call preserves each parameter's polarity. `A` occurs at even
+depths and `B` at odd depths, so `Tree[A, B]` produces `A` and consumes `B`.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from collections.abc import Callable
+from typing import Generic, TypeAlias, TypeVar
+from ty_extensions import static_assert
+from ty_extensions._internal import is_subtype_of
+
+A = TypeVar("A")
+B = TypeVar("B")
+Tree: TypeAlias = tuple[A, Callable[["Tree[B, A]"], None]]
+
+V = TypeVar("V", infer_variance=True)
+
+class Producer(Generic[V]):
+    def get(self) -> Tree[V, int]:
+        raise NotImplementedError
+
+class Consumer(Generic[V]):
+    def get(self) -> Tree[int, V]:
+        raise NotImplementedError
+
+static_assert(is_subtype_of(Producer[int], Producer[object]))
+static_assert(not is_subtype_of(Producer[object], Producer[int]))
+static_assert(is_subtype_of(Consumer[object], Consumer[int]))
+static_assert(not is_subtype_of(Consumer[int], Consumer[object]))
+```
+
+## Recursive alias parameters inside mutable children
+
+A parameter used only in recursive children still contributes their invariance.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Generic, TypeAlias, TypeVar
+from ty_extensions import static_assert
+from ty_extensions._internal import is_subtype_of
+
+A = TypeVar("A")
+B = TypeVar("B")
+Tree: TypeAlias = tuple[A, list["Tree[B, A]"]]
+
+V = TypeVar("V", infer_variance=True)
+
+class Producer(Generic[V]):
+    def get(self) -> Tree[int, V]:
+        raise NotImplementedError
+
+static_assert(not is_subtype_of(Producer[int], Producer[object]))
+static_assert(not is_subtype_of(Producer[object], Producer[int]))
+```
+
 [spec]: https://typing.python.org/en/latest/spec/generics.html#variance

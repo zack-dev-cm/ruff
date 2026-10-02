@@ -509,33 +509,9 @@ impl<'db> RecursiveType<'db> {
         typevar: BoundTypeVarIdentity<'db>,
     ) -> VarianceTerm<'db> {
         let env = self.environment(db);
-        let constructor = self.constructor(db);
-        let Some(body) = constructor.unfold(db, &env).into_unfolded() else {
-            return VarianceTerm::BIVARIANT;
-        };
-        let Some(arguments) = self.arguments(db) else {
-            return body.variance_of(db, &env, typevar);
-        };
-        let parameters = arguments.generic_context(db);
-        if parameters
-            .variables(db)
-            .any(|parameter| parameter.identity(db) == typevar)
-        {
-            return body.variance_of(db, &env, typevar);
-        }
-
-        // Measure each formal parameter once, then compose with the applied arguments. Unfolding
-        // specialized bodies here would keep creating new equations for `Tree[list[T]]`.
-        VarianceTerm::join(
-            db,
-            parameters
-                .variables(db)
-                .zip(arguments.types(db))
-                .map(|(parameter, argument)| {
-                    body.variance_of(db, &env, parameter.identity(db))
-                        .compose_thunk(db, || argument.variance_of(db, &env, typevar))
-                }),
-        )
+        self.unfold(db, &env)
+            .map(|body| body.variance_of(db, &env, typevar))
+            .unwrap_or(VarianceTerm::BIVARIANT)
     }
 }
 
@@ -756,10 +732,28 @@ impl<'db> VarianceInferable<'db> for RecursiveType<'db> {
     fn variance_of(
         self,
         db: &'db dyn Db,
-        _env: &ProgramEnvironment<'db>,
+        env: &ProgramEnvironment<'db>,
         typevar: BoundTypeVarIdentity<'db>,
     ) -> VarianceTerm<'db> {
-        VarianceTerm::variable(db, VarianceOrigin::Recursive(self), typevar)
+        let origin = VarianceOrigin::Recursive(self.constructor(db));
+        let Some(arguments) = self.arguments(db) else {
+            return VarianceTerm::variable(db, origin, typevar);
+        };
+
+        // Only constructors have equations. Every application composes those equations with its
+        // arguments, including references to the constructor's own parameters: `Tree[list[T]]`
+        // contributes the invariance of `list`, even while deriving the equation for `Tree[T]`.
+        VarianceTerm::join(
+            db,
+            arguments
+                .generic_context(db)
+                .variables(db)
+                .zip(arguments.types(db))
+                .map(|(parameter, argument)| {
+                    VarianceTerm::variable(db, origin, parameter.identity(db))
+                        .compose_thunk(db, || argument.variance_of(db, env, typevar))
+                }),
+        )
     }
 }
 

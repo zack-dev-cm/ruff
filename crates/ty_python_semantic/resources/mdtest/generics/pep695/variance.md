@@ -2312,6 +2312,80 @@ static_assert(is_subtype_of(MyWouldBeBivariant[Literal[1]], MyWouldBeBivariant[i
 static_assert(not is_subtype_of(MyWouldBeBivariant[int], MyWouldBeBivariant[Literal[1]]))
 ```
 
+## Recursive aliases with invariant argument transformations
+
+A recursive alias can introduce invariant occurrences below its first layer. The mutable lists in
+`Tree[list[T]]` make the producer invariant even though the root payload only produces `T`.
+
+```py
+from typing import TypeAlias, TypeVar
+from ty_extensions import static_assert
+from ty_extensions._internal import is_subtype_of
+
+T = TypeVar("T")
+Tree: TypeAlias = tuple[T, "Tree[list[T]] | None"]
+
+class Producer[V]:
+    def get(self) -> Tree[V]:
+        raise NotImplementedError
+
+static_assert(not is_subtype_of(Producer[int], Producer[object]))
+static_assert(not is_subtype_of(Producer[object], Producer[int]))
+
+def widen(value: Producer[int]) -> Producer[object]:
+    return value  # error: [invalid-return-type]
+```
+
+## Recursive aliases with permuted parameters
+
+Swapping parameters at a recursive call preserves each parameter's polarity. `A` occurs at even
+depths and `B` at odd depths, so `Tree[A, B]` produces `A` and consumes `B`.
+
+```py
+from collections.abc import Callable
+from typing import TypeAlias, TypeVar
+from ty_extensions import static_assert
+from ty_extensions._internal import is_subtype_of
+
+A = TypeVar("A")
+B = TypeVar("B")
+Tree: TypeAlias = tuple[A, Callable[["Tree[B, A]"], None]]
+
+class Producer[V]:
+    def get(self) -> Tree[V, int]:
+        raise NotImplementedError
+
+class Consumer[V]:
+    def get(self) -> Tree[int, V]:
+        raise NotImplementedError
+
+static_assert(is_subtype_of(Producer[int], Producer[object]))
+static_assert(not is_subtype_of(Producer[object], Producer[int]))
+static_assert(is_subtype_of(Consumer[object], Consumer[int]))
+static_assert(not is_subtype_of(Consumer[int], Consumer[object]))
+```
+
+## Recursive alias parameters inside mutable children
+
+A parameter used only in recursive children still contributes their invariance.
+
+```py
+from typing import TypeAlias, TypeVar
+from ty_extensions import static_assert
+from ty_extensions._internal import is_subtype_of
+
+A = TypeVar("A")
+B = TypeVar("B")
+Tree: TypeAlias = tuple[A, list["Tree[B, A]"]]
+
+class Producer[V]:
+    def get(self) -> Tree[int, V]:
+        raise NotImplementedError
+
+static_assert(not is_subtype_of(Producer[int], Producer[object]))
+static_assert(not is_subtype_of(Producer[object], Producer[int]))
+```
+
 ## Inheriting from generic classes with inferred variance
 
 When inheriting from a generic class with our type variable substituted in, we count its occurrences
