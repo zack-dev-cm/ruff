@@ -63,7 +63,7 @@ jobs:
             echo "Regression tests unexpectedly passed without the fix"
             exit 1
           fi
-          rg 'test result: FAILED.*3 failed' "$RUNNER_TEMP/evidence/baseline.log"
+          grep -E 'test result: FAILED.*3 failed' "$RUNNER_TEMP/evidence/baseline.log"
           git restore crates/ruff_linter/src/rules/flake8_tidy_imports/rules/lazy_import_mismatch.rs
       - name: Update and review generated snapshots
         env:
