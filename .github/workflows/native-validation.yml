@@ -1,0 +1,131 @@
+name: Native validation
+
+on:
+  push:
+    branches: [validation/lazy-import-stubs]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SOURCE_SHA: 0f3d5d7dc98e99e77ed86abb7d6b1100e70993c4
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_DEV_LTO: "false"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_PROFILE: minimal
+  UV_LOCKED: "1"
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 0f3d5d7dc98e99e77ed86abb7d6b1100e70993c4
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify source revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/evidence/source-sha.txt"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        with:
+          version: "0.12.18"
+          checksum: "89eadd7c76fc063887959510d5ba0ab1264dfd5f1143b925ddb73021a40acf16"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: native-tests
+      - name: Install development tools
+        run: |
+          rustup show
+          rustup component add rustfmt
+          uv sync --locked --only-dev
+          cargo fmt --all --check
+      - name: Prove the regression tests fail without the fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("crates/ruff_linter/src/rules/flake8_tidy_imports/rules/lazy_import_mismatch.rs")
+          text = path.read_text()
+          before = "if checker.source_type.is_stub()\n        || checker.lazy_import_context().is_some()"
+          assert text.count(before) == 1
+          path.write_text(text.replace(before, "if checker.lazy_import_context().is_some()"))
+          PY
+          if cargo test --locked -p ruff_linter preview_lazy_import_mismatch_stub -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/baseline.log"; then
+            echo "Regression tests unexpectedly passed without the fix"
+            exit 1
+          fi
+          rg 'test result: FAILED.*3 failed' "$RUNNER_TEMP/evidence/baseline.log"
+          git restore crates/ruff_linter/src/rules/flake8_tidy_imports/rules/lazy_import_mismatch.rs
+      - name: Update and review generated snapshots
+        env:
+          INSTA_FORCE_PASS: "1"
+          INSTA_UPDATE: always
+          MDTEST_UPDATE_SNAPSHOTS: "1"
+        run: |
+          uv run --locked --only-dev cargo nextest run --all-features --status-level fail --final-status-level fail 2>&1 | tee "$RUNNER_TEMP/evidence/update-tests.log"
+          git diff > "$RUNNER_TEMP/evidence/generated.diff"
+          find crates -name '*.pending-snap' -print > "$RUNNER_TEMP/evidence/pending-snapshots.txt"
+          test ! -s "$RUNNER_TEMP/evidence/pending-snapshots.txt"
+          git diff --exit-code
+      - name: Run all tests with snapshot updates disabled
+        env:
+          INSTA_UPDATE: no
+        run: uv run --locked --only-dev cargo nextest run --all-features --status-level fail --final-status-level fail 2>&1 | tee "$RUNNER_TEMP/evidence/tests.log"
+      - name: Run doctests
+        run: cargo test --locked --doc --all-features 2>&1 | tee "$RUNNER_TEMP/evidence/doctests.log"
+      - name: Regenerate documentation and schemas
+        run: |
+          cargo dev generate-all 2>&1 | tee "$RUNNER_TEMP/evidence/generation.log"
+          git diff > "$RUNNER_TEMP/evidence/generation.diff"
+          git diff --exit-code
+      - name: Run hooks for every changed file
+        run: |
+          uv run --only-dev --locked prek run --files crates/ruff_linter/src/rules/flake8_tidy_imports/mod.rs crates/ruff_linter/src/rules/flake8_tidy_imports/rules/lazy_import_mismatch.rs 2>&1 | tee "$RUNNER_TEMP/evidence/hooks.log"
+          git diff --exit-code
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ruff-tests
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 14
+  clippy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_WARNINGS: deny
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 0f3d5d7dc98e99e77ed86abb7d6b1100e70993c4
+          persist-credentials: false
+      - name: Verify source revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/evidence/source-sha.txt"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: native-clippy
+      - name: Install Clippy
+        run: rustup component add clippy
+      - name: Check the entire workspace
+        run: cargo clippy --locked --workspace --all-targets --all-features 2>&1 | tee "$RUNNER_TEMP/evidence/clippy.log"
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ruff-clippy
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 14
