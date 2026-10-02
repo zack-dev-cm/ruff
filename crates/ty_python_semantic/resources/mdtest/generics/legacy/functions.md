@@ -3206,6 +3206,81 @@ def repeat(flag: bool):
     wrong: str = value[1]  # error: [invalid-assignment]
 ```
 
+## Recursive calls with nested specializations of one alias
+
+Finite nesting of the same alias still simplifies each specialization. Here, `Alias[object, T]` is
+`list[object]`, so the second tuple element converges to `list[int | list[object]]`.
+
+```py
+from typing_extensions import TypeAliasType, TypeVar
+
+A = TypeVar("A")
+B = TypeVar("B")
+T = TypeVar("T")
+Alias = TypeAliasType("Alias", list[A | B], type_params=(A, B))
+
+def advance(value: tuple[T, object]) -> tuple[Alias[int, Alias[object, T]], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: list[int | list[object]] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive calls with indirectly nested alias specializations
+
+Finite nesting also preserves specialization when an alias's value uses another alias.
+
+```py
+from typing_extensions import TypeAliasType, TypeVar
+
+A = TypeVar("A")
+B = TypeVar("B")
+T = TypeVar("T")
+Alias = TypeAliasType("Alias", list[A | B], type_params=(A, B))
+Erased = TypeAliasType("Erased", Alias[object, T], type_params=(T,))
+
+def advance(value: tuple[T, object]) -> tuple[Alias[int, Erased[T]], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: list[int | list[object]] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive calls with permuted alias arguments
+
+Permuting arguments does not grow an alias's specialization. Both permutations simplify the payload
+to `object`, so the recursive tuple remains known.
+
+```py
+from typing_extensions import TypeAliasType, TypeVar
+
+A = TypeVar("A")
+B = TypeVar("B")
+T = TypeVar("T")
+Alias = TypeAliasType("Alias", tuple[A | B, "Alias[B, A] | None"], type_params=(A, B))
+
+def advance(value: tuple[T, object]) -> tuple[Alias[object, T], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: tuple[object, object] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
 ## Unresolved arguments through recursive aliases
 
 A recursive alias still retains dependencies on parameters used in its value. Repeated calls keep
@@ -3243,6 +3318,33 @@ A = TypeVar("A")
 B = TypeVar("B")
 T = TypeVar("T")
 Tree: TypeAlias = tuple[A, Sequence["Tree[Sequence[B], A]"]]
+
+def grow(value: tuple[T, object]) -> tuple[Tree[int, T], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = grow(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    reveal_type(value[0][0])  # revealed: int
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[0][0]  # error: [invalid-assignment]
+```
+
+## Growing recursive aliases through nested wrapper aliases
+
+Finite wrapper aliases inside a recursive definition preserve its dependency. Unfolding them still
+stops at the growing recursive child, while the root's integer payload remains known.
+
+```py
+from typing import TypeAlias, TypeVar
+from typing_extensions import TypeAliasType
+
+A = TypeVar("A")
+B = TypeVar("B")
+T = TypeVar("T")
+Wrapper = TypeAliasType("Wrapper", tuple[T], type_params=(T,))
+Tree: TypeAlias = tuple[A, "Wrapper[Wrapper[Tree[list[B], A]]] | None"]
 
 def grow(value: tuple[T, object]) -> tuple[Tree[int, T], T]:
     raise NotImplementedError

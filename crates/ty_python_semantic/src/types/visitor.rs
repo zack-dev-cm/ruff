@@ -821,7 +821,7 @@ where
         env: &'a ProgramEnvironment<'db>,
         query: &'a dyn Fn(Type<'db>) -> U,
         recursion_guard: TypeCollector<'db>,
-        active_aliases: ActiveRecursionDetector<Definition<'db>>,
+        active_aliases: RefCell<Vec<(Definition<'db>, Type<'db>)>>,
         found_matching_type: Cell<U>,
         mode: TypeSearchMode,
     }
@@ -830,6 +830,57 @@ where
     where
         U: Copy + Default + PartialEq,
     {
+        /// Visit supplied arguments outside their owner's expansion scope. Recursive references
+        /// introduced by a definition retain that scope, unless they only permute existing subterms.
+        fn visit_alias_value(
+            &self,
+            db: &'db dyn Db,
+            ty: Type<'db>,
+            definition: Definition<'db>,
+            constructor: Type<'db>,
+            arguments: Option<Specialization<'db>>,
+            value: impl FnOnce() -> Type<'db>,
+        ) {
+            let active = self.active_aliases.borrow();
+            let mut scope_end = active
+                .iter()
+                .rposition(|(_, owner)| {
+                    any_over_type_including_alias_arguments(db, self.env, *owner, |nested| {
+                        nested != *owner && nested == ty
+                    })
+                })
+                .unwrap_or(active.len());
+            let enclosing = active[..scope_end].iter().enumerate().rev().find_map(
+                |(index, (active_definition, active))| {
+                    (*active_definition == definition).then_some((index, *active))
+                },
+            );
+            drop(active);
+            if let Some((index, enclosing)) = enclosing {
+                let reuses_arguments = arguments.is_some_and(|arguments| {
+                    arguments.types(db).iter().all(|argument| {
+                        any_over_type_including_alias_arguments(db, self.env, enclosing, |nested| {
+                            nested != enclosing && nested == *argument
+                        })
+                    })
+                });
+                if !reuses_arguments {
+                    self.visit_alias_arguments(db, constructor, arguments);
+                    return;
+                }
+                scope_end = index;
+            }
+
+            // Expanding `A[int, Erased[T]]` must let the argument `Erased[T] = A[object, T]`
+            // inspect its own `A` specialization. Definitions preceding the argument's owner
+            // remain active, so nesting aliases cannot hide a growing recursive edge.
+            let suspended = self.active_aliases.borrow_mut().split_off(scope_end);
+            self.active_aliases.borrow_mut().push((definition, ty));
+            self.visit_type(db, value());
+            self.active_aliases.borrow_mut().pop();
+            self.active_aliases.borrow_mut().extend(suspended);
+        }
+
         /// Close an alias backedge without expanding a growing specialization. Bivariant
         /// parameters cannot contribute a match, even when their stored arguments contain one.
         fn visit_alias_arguments(
@@ -900,16 +951,13 @@ where
 
         fn visit_type_alias_type(&self, db: &'db dyn Db, alias: TypeAliasType<'db>) {
             if matches!(self.mode, TypeSearchMode::IncludeAliasValues) {
-                self.active_aliases.visit(
-                    &alias.definition(db),
-                    || {
-                        self.visit_alias_arguments(
-                            db,
-                            Type::TypeAlias(alias.unspecialized(db)),
-                            alias.specialization(db),
-                        );
-                    },
-                    || self.visit_type(db, alias.value_type(db)),
+                self.visit_alias_value(
+                    db,
+                    Type::TypeAlias(alias),
+                    alias.definition(db),
+                    Type::TypeAlias(alias.unspecialized(db)),
+                    alias.specialization(db),
+                    || alias.value_type(db),
                 );
             } else {
                 walk_type_alias_type(db, alias, self);
@@ -918,16 +966,13 @@ where
 
         fn visit_recursive_type(&self, db: &'db dyn Db, recursive: RecursiveType<'db>) {
             if matches!(self.mode, TypeSearchMode::IncludeAliasValues) {
-                self.active_aliases.visit(
-                    &recursive.definition(db),
-                    || {
-                        self.visit_alias_arguments(
-                            db,
-                            Type::Recursive(recursive.constructor(db)),
-                            recursive.arguments(db),
-                        );
-                    },
-                    || self.visit_type(db, recursive.unfold(db, self.env).into_type()),
+                self.visit_alias_value(
+                    db,
+                    Type::Recursive(recursive),
+                    recursive.definition(db),
+                    Type::Recursive(recursive.constructor(db)),
+                    recursive.arguments(db),
+                    || recursive.unfold(db, self.env).into_type(),
                 );
             } else if self.should_visit_lazy_type_attributes() {
                 self.visit_type(db, recursive.unfold(db, self.env).into_type());
@@ -941,7 +986,7 @@ where
         env,
         query: &query,
         recursion_guard: TypeCollector::default(),
-        active_aliases: ActiveRecursionDetector::default(),
+        active_aliases: RefCell::default(),
         found_matching_type: Cell::default(),
         mode,
     };
