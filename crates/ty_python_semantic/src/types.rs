@@ -2293,16 +2293,15 @@ impl<'db> Type<'db> {
         let Type::Divergent(divergent) = self else {
             return None;
         };
-        let root = match divergent.origin {
-            DivergentOrigin::Recursive(root) => root,
-            DivergentOrigin::PendingInference(id) => PendingInference::from_id(id).root(db),
-            DivergentOrigin::PendingNarrowing => return None,
+        let id = divergent.id?;
+        let root = if divergent.flags.contains(DivergentFlags::PENDING_INFERENCE) {
+            PendingInference::from_id(id).root(db)
+        } else {
+            id
         };
         Some(Self::Divergent(DivergentType {
-            origin: DivergentOrigin::PendingInference(
-                PendingInference::new(db, root, typevar, call_site).as_id(),
-            ),
-            flags: DivergentFlags::empty(),
+            id: Some(PendingInference::new(db, root, typevar, call_site).as_id()),
+            flags: DivergentFlags::PENDING_INFERENCE,
             materialization: None,
         }))
     }
@@ -2310,13 +2309,16 @@ impl<'db> Type<'db> {
     /// Returns the identity of an unavailable type argument.
     fn as_pending_inference(self) -> Option<PendingInference<'db>> {
         let Type::Divergent(DivergentType {
-            origin: DivergentOrigin::PendingInference(id),
+            id: Some(id),
+            flags,
             ..
         }) = self
         else {
             return None;
         };
-        Some(PendingInference::from_id(id))
+        flags
+            .contains(DivergentFlags::PENDING_INFERENCE)
+            .then(|| PendingInference::from_id(id))
     }
 
     /// Returns a divergent marker for a cycle in type alias inference.
@@ -2329,29 +2331,24 @@ impl<'db> Type<'db> {
 
     const fn pending_narrowing() -> Self {
         Self::Divergent(DivergentType {
-            origin: DivergentOrigin::PendingNarrowing,
+            id: None,
             flags: DivergentFlags::empty(),
             materialization: None,
         })
     }
 
     const fn is_pending_narrowing(&self) -> bool {
-        matches!(
-            self,
-            Self::Divergent(DivergentType {
-                origin: DivergentOrigin::PendingNarrowing,
-                ..
-            })
-        )
+        matches!(self, Self::Divergent(DivergentType { id: None, .. }))
     }
 
     const fn is_recursive_divergent(&self) -> bool {
         matches!(
             self,
             Self::Divergent(DivergentType {
-                origin: DivergentOrigin::Recursive(_),
+                id: Some(_),
+                flags,
                 ..
-            })
+            }) if !flags.contains(DivergentFlags::PENDING_INFERENCE)
         )
     }
 
@@ -11245,21 +11242,12 @@ bitflags! {
         /// The cycle comes from type alias inference. Value inference can also diverge,
         /// for example when an assignment feeds into the next iteration of a loop.
         const FROM_TYPE_ALIAS = 1 << 0;
+        /// The ID names an interned pending binding, rather than a recursive query.
+        const PENDING_INFERENCE = 1 << 1;
     }
 }
 
 impl get_size2::GetSize for DivergentFlags {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum DivergentOrigin {
-    /// A back-reference to the query that caused a recursive inference cycle.
-    Recursive(salsa::Id),
-    /// A predicate's narrowing is not yet known. This carries no recursive type identity.
-    PendingNarrowing,
-    /// A type argument depends on an unresolved argument shape. The interned identity records
-    /// its query, call site, and type variable; it is not a back-reference to the query result.
-    PendingInference(salsa::Id),
-}
 
 /// Stable identity for an unavailable generic argument. Revisiting the same call's type variable
 /// can add arbitrarily many containers without providing a concrete binding. A separate call to
@@ -11284,7 +11272,10 @@ struct PendingInference<'db> {
 /// For detailed properties of this type, see the unit test at the end of the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DivergentType {
-    origin: DivergentOrigin,
+    /// A recursive query or, with `PENDING_INFERENCE`, an interned pending binding.
+    /// `None` represents pending narrowing, which has no recursive identity.
+    /// Keeping the identity kind in `flags` lets `Type` remain 16 bytes.
+    id: Option<salsa::Id>,
     flags: DivergentFlags,
     /// If this divergent marker has been materialized, preserve whether it should behave like the
     /// top (`object`) or bottom (`Never`) bound while still remaining recognizable as divergent.
@@ -11297,14 +11288,16 @@ impl get_size2::GetSize for DivergentType {}
 impl DivergentType {
     const fn new(id: salsa::Id) -> Self {
         Self {
-            origin: DivergentOrigin::Recursive(id),
+            id: Some(id),
             flags: DivergentFlags::empty(),
             materialization: None,
         }
     }
 
     fn same_marker(self, other: Self) -> bool {
-        self.origin == other.origin
+        self.id == other.id
+            && self.flags.contains(DivergentFlags::PENDING_INFERENCE)
+                == other.flags.contains(DivergentFlags::PENDING_INFERENCE)
     }
 
     const fn materialized(self, kind: MaterializationKind) -> Self {
