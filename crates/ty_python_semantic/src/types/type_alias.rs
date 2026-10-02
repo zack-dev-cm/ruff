@@ -765,7 +765,7 @@ impl<'db> TypeAliasType<'db> {
     }
 
     /// Rewrite stored arguments without evaluating the alias's definition or defaults.
-    fn map_stored_specialization(
+    pub(super) fn map_stored_specialization(
         self,
         db: &'db dyn Db,
         mapping: &TypeMapping<'_, 'db>,

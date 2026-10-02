@@ -3229,6 +3229,126 @@ def repeat(flag: bool):
     wrong: str = value[1]  # error: [invalid-assignment]
 ```
 
+## Recursive calls with aliases inside union members
+
+Normalizing `Identity[T]` also simplifies the enclosing tuple union to `tuple[object]`. The erased
+argument does not make the list provisional.
+
+```py
+from typing_extensions import TypeAliasType, TypeVar
+
+T = TypeVar("T")
+Identity = TypeAliasType("Identity", T, type_params=(T,))
+
+def advance(value: tuple[T, object]) -> tuple[list[tuple[object] | tuple[Identity[T]]], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: list[tuple[object]] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive calls with aliases inside callable unions
+
+A callable returning `object` absorbs a callable returning `Identity[T]`, including when the alias
+appears in the first union member.
+
+```py
+from collections.abc import Callable
+from typing_extensions import TypeAliasType, TypeVar
+
+T = TypeVar("T")
+Identity = TypeAliasType("Identity", T, type_params=(T,))
+
+def advance(value: tuple[T, object]) -> tuple[list[Callable[[], Identity[T]] | Callable[[], object]], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: list[Callable[[], object]] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive calls with aliases inside covariant class unions
+
+Normalizing an alias in a covariant class argument lets the enclosing union absorb the unresolved
+argument.
+
+```py
+from typing import Generic
+from typing_extensions import TypeAliasType, TypeVar
+
+T = TypeVar("T")
+Identity = TypeAliasType("Identity", T, type_params=(T,))
+S = TypeVar("S", covariant=True)
+
+class Source(Generic[S]):
+    def get(self) -> S:
+        raise NotImplementedError
+
+def advance(value: tuple[T, object]) -> tuple[list[Source[object] | Source[Identity[T]]], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: list[Source[object]] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive calls with absorbed recursive union members
+
+`tuple[object, object]` absorbs the recursive tuple. Its unresolved payload contributes no
+dependency even though normalization retains recursive references inside the other member.
+
+```py
+from typing import TypeAlias, TypeVar
+
+T = TypeVar("T")
+Tree: TypeAlias = tuple[T, "Tree[T] | None"]
+
+def advance(value: tuple[T, object]) -> tuple[list[tuple[object, object] | Tree[T]], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: list[tuple[object, object]] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive calls with live aliases in invariant union members
+
+`list` is invariant, so `list[object]` does not absorb `list[Identity[T]]`. The recursive binding
+remains provisional while the return type retains its outer list.
+
+```py
+from typing_extensions import TypeAliasType, TypeVar
+
+T = TypeVar("T")
+Identity = TypeAliasType("Identity", T, type_params=(T,))
+
+def advance(value: tuple[T, object]) -> tuple[list[list[object] | list[Identity[T]]], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[0]  # error: [invalid-assignment]
+```
+
 ## Recursive calls with live dependencies in alias unions
 
 An alias to `int` does not absorb an unresolved type argument. The recursive binding stays
@@ -3319,6 +3439,58 @@ Top = TypeAliasType("Top", object)
 Alias: TypeAlias = tuple[A | B, "Alias[Top, B] | None"]
 
 def advance(value: tuple[T, object]) -> tuple[Alias[object, T], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: tuple[object, object] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive aliases with constant generic arguments
+
+`Constant[B]` is `object`, so the recursive child has the same specialization as its parent. Neither
+payload depends on the unresolved second argument.
+
+```py
+from typing_extensions import TypeAliasType, TypeVar
+
+A = TypeVar("A")
+B = TypeVar("B")
+T = TypeVar("T")
+Constant = TypeAliasType("Constant", object, type_params=(T,))
+Tree = TypeAliasType("Tree", tuple[A | B, "Tree[Constant[B], B] | None"], type_params=(A, B))
+
+def advance(value: tuple[T, object]) -> tuple[Tree[object, T], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: tuple[object, object] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Implicit recursive aliases with constant generic arguments
+
+An implicit recursive alias also normalizes the argument before closing the recursive reference.
+
+```py
+from typing import TypeAlias, TypeVar
+from typing_extensions import TypeAliasType
+
+A = TypeVar("A")
+B = TypeVar("B")
+T = TypeVar("T")
+Constant = TypeAliasType("Constant", object, type_params=(T,))
+Tree: TypeAlias = tuple[A | B, "Tree[Constant[B], B] | None"]
+
+def advance(value: tuple[T, object]) -> tuple[Tree[object, T], T]:
     raise NotImplementedError
 
 def repeat(flag: bool):

@@ -570,6 +570,7 @@ pub(crate) struct UnionBuilder<'db> {
     db: &'db dyn Db,
     env: ProgramEnvironment<'db>,
     unpack_aliases: bool,
+    compare_preserved_aliases: bool,
     /// This is enabled when joining types in a `cycle_recovery` function. Because recovery cannot
     /// introduce a new cycle, relation-based union simplifications are skipped in this mode.
     cycle_recovery: bool,
@@ -646,6 +647,7 @@ impl<'db> UnionBuilder<'db> {
             env: env.clone(),
             elements: vec![],
             unpack_aliases: true,
+            compare_preserved_aliases: false,
             cycle_recovery: false,
             recursively_defined: RecursivelyDefined::No,
         }
@@ -653,6 +655,13 @@ impl<'db> UnionBuilder<'db> {
 
     pub(crate) fn unpack_aliases(mut self, val: bool) -> Self {
         self.unpack_aliases = val;
+        self
+    }
+
+    /// Allow redundancy comparisons after alias normalization has finished. Recursive aliases
+    /// remain opaque union members, but can still be absorbed by a containing type.
+    pub(super) fn compare_preserved_aliases(mut self, val: bool) -> Self {
+        self.compare_preserved_aliases = val;
         self
     }
 
@@ -1054,10 +1063,11 @@ impl<'db> UnionBuilder<'db> {
             }
         };
 
-        // If an alias gets here, it means we aren't unpacking aliases, and we also
-        // shouldn't try to simplify aliases out of the union, because that will require
-        // unpacking them.
-        let should_simplify_full = !ty.is_alias_like() && !self.cycle_recovery;
+        // Preserved aliases ordinarily skip relations because comparisons can re-enter the
+        // specialization that builds this union. Alias normalization explicitly enables those
+        // comparisons after rebuilding the operands.
+        let should_simplify_full =
+            (!ty.is_alias_like() || self.compare_preserved_aliases) && !self.cycle_recovery;
 
         let mut ty_negated: Option<Type> = None;
         let mut to_remove = SmallVec::<[usize; 2]>::new();
@@ -1138,10 +1148,13 @@ impl<'db> UnionBuilder<'db> {
                 continue;
             }
 
-            if should_simplify_full && !element_type.is_alias_like() {
-                // Preserving aliases also excludes comparisons that expand aliases nested in
-                // type arguments. A recursive alias can rebuild this union during specialization.
+            if should_simplify_full
+                && (!element_type.is_alias_like() || self.compare_preserved_aliases)
+            {
+                // This also applies to aliases nested in type arguments. A recursive alias can
+                // rebuild this union during specialization.
                 if !self.unpack_aliases
+                    && !self.compare_preserved_aliases
                     && [ty, element_type]
                         .into_iter()
                         .any(|ty| any_over_type(db, &self.env, ty, false, Type::is_alias_like))
@@ -1202,6 +1215,7 @@ impl<'db> UnionBuilder<'db> {
         let db = self.db;
 
         let unpack_aliases = self.unpack_aliases;
+        let compare_preserved_aliases = self.compare_preserved_aliases;
         let cycle_recovery = self.cycle_recovery;
         let recursively_defined = self.recursively_defined;
 
@@ -1248,6 +1262,7 @@ impl<'db> UnionBuilder<'db> {
         if normalize_enum_complement_unions(db, &self.env, &mut types) {
             let builder = UnionBuilder::new(db, &self.env)
                 .unpack_aliases(unpack_aliases)
+                .compare_preserved_aliases(compare_preserved_aliases)
                 .cycle_recovery(cycle_recovery)
                 .or_recursively_defined(recursively_defined);
             return types

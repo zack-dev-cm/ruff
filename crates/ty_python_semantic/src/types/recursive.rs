@@ -270,7 +270,11 @@ impl<'db> RecursiveType<'db> {
         }
     }
 
-    fn with_arguments(self, db: &'db dyn Db, arguments: Option<Specialization<'db>>) -> Self {
+    pub(super) fn with_arguments(
+        self,
+        db: &'db dyn Db,
+        arguments: Option<Specialization<'db>>,
+    ) -> Self {
         Self::new_internal(
             db,
             self.definition(db),

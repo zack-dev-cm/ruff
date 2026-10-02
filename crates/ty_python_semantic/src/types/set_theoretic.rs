@@ -292,6 +292,18 @@ impl<'db> UnionType<'db> {
                     .collect::<Box<[_]>>(),
                 self.recursively_defined(db),
             ))
+        } else if matches!(type_mapping, TypeMapping::NormalizeAliases) {
+            self.elements(db)
+                .iter()
+                .map(|element| element.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
+                .fold(
+                    UnionBuilder::new(db, visitor.env)
+                        .unpack_aliases(false)
+                        .compare_preserved_aliases(true)
+                        .or_recursively_defined(self.recursively_defined(db)),
+                    UnionBuilder::add,
+                )
+                .build()
         } else {
             self.map_leave_aliases(db, visitor.env, |element| {
                 element.apply_type_mapping_impl(db, type_mapping, tcx, visitor)

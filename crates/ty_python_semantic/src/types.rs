@@ -132,6 +132,7 @@ use ty_python_core::scope::ScopeId;
 use ty_python_core::{ProgramFile, Truthiness, place_table, semantic_index, use_def_map};
 
 mod abstract_methods;
+mod alias_normalization;
 mod attribute_write;
 mod bool;
 mod bound_super;
@@ -506,11 +507,13 @@ struct ApplyMaterializationEquivalence;
 type MaterializationEquivalenceVisitor<'db> =
     Rc<CycleDetector<'db, ApplyMaterializationEquivalence, (Type<'db>, Type<'db>), bool, 1>>;
 
-/// A [`TypeTransformer`] that is used in `apply_type_mapping` methods.
+/// Recursion state used in `apply_type_mapping` methods.
 ///
 /// Some recursive transformations visit the same type under more than one mapping mode within a
 /// single call chain. Keep separate cycle caches for those modes so one transformation cannot
 /// reuse the result of another.
+/// Alias normalization uses local guards instead: its partial expansions depend on which alias
+/// definitions are currently active and cannot be cached across expansion scopes.
 pub(crate) struct ApplyTypeMappingVisitor<'env, 'db> {
     env: &'env ProgramEnvironment<'db>,
     recursion_context: Option<&'env TypeRecursionContext<'db>>,
@@ -523,6 +526,7 @@ pub(crate) struct ApplyTypeMappingVisitor<'env, 'db> {
     bottom_specialization_materialization: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
     promotion: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
     skip_promotion: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
+    alias_normalization: OnceCell<Box<alias_normalization::AliasNormalizationVisitor<'db>>>,
     materialization_equivalence: OnceCell<MaterializationEquivalenceVisitor<'db>>,
 }
 
@@ -539,6 +543,7 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
             bottom_specialization_materialization: OnceCell::default(),
             promotion: OnceCell::default(),
             skip_promotion: OnceCell::default(),
+            alias_normalization: OnceCell::default(),
             materialization_equivalence: OnceCell::default(),
         }
     }
@@ -567,6 +572,9 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
         type_mapping: &TypeMapping<'_, 'db>,
         func: impl FnOnce() -> Type<'db>,
     ) -> Type<'db> {
+        if matches!(type_mapping, TypeMapping::NormalizeAliases) {
+            return self.alias_normalization().visit_type(ty, func);
+        }
         let type_transformer = match type_mapping {
             TypeMapping::Materialize(MaterializationKind::Top) => &self.top_materialization,
             TypeMapping::Materialize(MaterializationKind::Bottom) => &self.bottom_materialization,
@@ -585,6 +593,10 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
         type_transformer
             .get_or_init(Box::default)
             .visit_type(db, ty, func)
+    }
+
+    fn alias_normalization(&self) -> &alias_normalization::AliasNormalizationVisitor<'db> {
+        self.alias_normalization.get_or_init(Box::default)
     }
 
     fn is_equivalent_to_materialization(
@@ -9451,6 +9463,11 @@ impl<'db> Type<'db> {
         tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Type<'db> {
+        if matches!(type_mapping, TypeMapping::NormalizeAliases) && self.is_alias_like() {
+            return visitor
+                .alias_normalization()
+                .normalize_alias(db, self, visitor);
+        }
         // If we are binding `typing.Self`, and this type is what we are binding `Self` to, return
         // early. This is not just an optimization, it also prevents us from infinitely expanding
         // the type, if it's something that can contain a `Self` reference.
@@ -9651,6 +9668,9 @@ impl<'db> Type<'db> {
             }
 
             Type::NewTypeInstance(newtype) => visitor.visit(db, self, type_mapping, || {
+                if matches!(type_mapping, TypeMapping::NormalizeAliases) {
+                    return Type::NewTypeInstance(newtype.normalize_aliases(db, visitor));
+                }
                 Type::NewTypeInstance(newtype.map_base_class_type(db, |class_type| {
                     class_type.apply_type_mapping_impl(db, type_mapping, tcx, visitor)
                 }))
@@ -9782,6 +9802,7 @@ impl<'db> Type<'db> {
                 | TypeMapping::Materialize(_)
                 | TypeMapping::ReplaceParameterDefaults
                 | TypeMapping::EagerExpansion
+                | TypeMapping::NormalizeAliases
                 | TypeMapping::RescopeReturnCallables(_)
                 | TypeMapping::Promote(PromotionMode::Off, _)
                 | TypeMapping::Promote(
@@ -9804,6 +9825,7 @@ impl<'db> Type<'db> {
                 | TypeMapping::Promote(..)
                 | TypeMapping::ReplaceParameterDefaults
                 | TypeMapping::EagerExpansion
+                | TypeMapping::NormalizeAliases
                 | TypeMapping::RescopeReturnCallables(_) => self,
                 TypeMapping::Materialize(materialization_kind) => match materialization_kind {
                     MaterializationKind::Top => Type::object(),
@@ -11113,6 +11135,10 @@ pub enum TypeMapping<'a, 'db> {
     /// In the case of recursive type aliases, this will diverge, so that part will be replaced with `Divergent`.
     EagerExpansion,
 
+    /// Expand specialized alias values and rebuild enclosing types, retaining opaque aliases at
+    /// recursive references. This does not force other lazy type attributes.
+    NormalizeAliases,
+
     /// Updates any `Callable` types in a function signature return type to be generic if possible.
     RescopeReturnCallables(&'a FxHashMap<CallableType<'db>, CallableType<'db>>),
 }
@@ -11174,6 +11200,7 @@ impl<'db> TypeMapping<'_, 'db> {
             | TypeMapping::Materialize(_)
             | TypeMapping::ReplaceParameterDefaults
             | TypeMapping::EagerExpansion
+            | TypeMapping::NormalizeAliases
             | TypeMapping::RescopeReturnCallables(_) => context,
             TypeMapping::BindSelf(binding) => {
                 if binding.binding_context().is_some() {
@@ -11222,6 +11249,7 @@ impl<'db> TypeMapping<'_, 'db> {
             | TypeMapping::ReplaceSelf { .. }
             | TypeMapping::ReplaceParameterDefaults
             | TypeMapping::EagerExpansion
+            | TypeMapping::NormalizeAliases
             | TypeMapping::RescopeReturnCallables(_) => self.clone(),
         }
     }

@@ -581,6 +581,13 @@ impl<'db> KnownInstanceType<'db> {
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Type<'db> {
         match self {
+            KnownInstanceType::NewType(newtype)
+                if matches!(type_mapping, TypeMapping::NormalizeAliases) =>
+            {
+                Type::KnownInstance(KnownInstanceType::NewType(
+                    newtype.normalize_aliases(db, visitor),
+                ))
+            }
             KnownInstanceType::TypeVar(typevar) => match type_mapping {
                 TypeMapping::BindLegacyTypevars(binding_context) => {
                     Type::TypeVar(BoundTypeVarInstance::new(
@@ -600,6 +607,7 @@ impl<'db> KnownInstanceType<'db> {
                 | TypeMapping::Materialize(_)
                 | TypeMapping::ReplaceParameterDefaults
                 | TypeMapping::EagerExpansion
+                | TypeMapping::NormalizeAliases
                 | TypeMapping::RescopeReturnCallables(_)
                 | TypeMapping::ApplyRecursiveSubstitution(_) => Type::KnownInstance(self),
             },

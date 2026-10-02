@@ -1305,10 +1305,12 @@ impl<'db> FunctionType<'db> {
         tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Self {
-        // Returned-callable rescoping and type-alias specialization should not rebuild signatures from the
-        // function literal; doing so can re-enter recursive `TypeOf` evaluation.
+        // Structural substitution, alias normalization, and type-alias specialization should not
+        // rebuild signatures from the function literal; doing so can re-enter recursive `TypeOf`
+        // evaluation.
         let literal = self.literal(db);
         let (updated_signature, updated_implementation_callables) = if type_mapping.is_structural()
+            || matches!(type_mapping, TypeMapping::NormalizeAliases)
             || matches!(
                 type_mapping,
                 TypeMapping::ApplySpecialization(specialization)
