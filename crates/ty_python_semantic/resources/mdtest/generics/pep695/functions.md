@@ -3832,6 +3832,108 @@ def repeat(flag: bool):
     wrong: str = value[1]  # error: [invalid-assignment]
 ```
 
+## Recursive calls with aliases in nested unions
+
+An alias to `object` absorbs the other union alternatives, including unresolved type arguments. The
+inferred list remains assignable to `list[object]`, and we reject assigning it to `str`.
+
+```py
+type Top = object
+
+def advance[T](value: tuple[T, object]) -> tuple[list[Top | T], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: list[object] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive calls with live dependencies in alias unions
+
+An alias to `int` does not absorb an unresolved type argument. The recursive binding stays
+provisional, and the returned list retains its known structure.
+
+```py
+type Scalar = int
+
+def advance[T](value: tuple[T, object]) -> tuple[list[Scalar | T], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    reveal_type(value[0])  # revealed: list[Scalar | Divergent]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[0]  # error: [invalid-assignment]
+```
+
+## Recursive calls with sibling alias specializations
+
+Separate union alternatives can specialize the same alias independently. The inner
+`Alias[object, T]` removes the unresolved dependency in both alternatives.
+
+```py
+type Alias[A, B] = list[A | B]
+
+def advance[T](value: tuple[T, object]) -> tuple[list[Alias[int, Alias[object, T]] | Alias[str, Alias[object, T]]], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: list[list[int | list[object]] | list[str | list[object]]] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive aliases that reset an argument to a constant
+
+The root payload simplifies to `object` through `Top`. The recursive child sets its first argument
+to `object` directly, so neither payload depends on the unresolved second argument.
+
+```py
+type Top = object
+type Alias[A, B] = tuple[A | B, Alias[object, B] | None]
+
+def advance[T](value: tuple[T, object]) -> tuple[Alias[Top, T], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: tuple[object, object] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive aliases that introduce a constant alias
+
+A recursive child can introduce an alias from the definition. Its payload also simplifies to
+`object`, preserving the known tuple type.
+
+```py
+type Top = object
+type Alias[A, B] = tuple[A | B, Alias[Top, B] | None]
+
+def advance[T](value: tuple[T, object]) -> tuple[Alias[object, T], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: tuple[object, object] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
 ## Recursive calls with nested specializations of one alias
 
 Finite nesting of the same alias still simplifies each specialization. Here, `Alias[object, T]` is
@@ -3879,6 +3981,27 @@ to `object`, so the recursive tuple remains known.
 
 ```py
 type Alias[A, B] = tuple[A | B, Alias[B, A] | None]
+
+def advance[T](value: tuple[T, object]) -> tuple[Alias[object, T], T]:
+    raise NotImplementedError
+
+def repeat(flag: bool):
+    while flag:
+        value = advance(value)  # error: [possibly-unresolved-reference]
+    # error: [possibly-unresolved-reference]
+    known: tuple[object, object] = value[1]
+    # error: [possibly-unresolved-reference]
+    wrong: str = value[1]  # error: [invalid-assignment]
+```
+
+## Recursive aliases with absorbed growing children
+
+The recursive child would expose the unresolved argument, but its union with `Top` is always
+`object`. The growing child therefore contributes no dependency to the inferred tuple.
+
+```py
+type Top = object
+type Alias[A, B] = tuple[A, Alias[B, list[A]] | Top]
 
 def advance[T](value: tuple[T, object]) -> tuple[Alias[object, T], T]:
     raise NotImplementedError

@@ -817,11 +817,20 @@ where
     T: Copy + Default + PartialEq,
     F: Fn(Type<'db>) -> T,
 {
+    struct ActiveAlias<'db> {
+        definition: Definition<'db>,
+        alias: Type<'db>,
+        /// The original alias or union. Its supplied arguments and sibling operands do not
+        /// belong to the recursive expansion introduced by this alias.
+        scope: Type<'db>,
+    }
+
     struct AnyOverTypeVisitor<'db, 'a, U> {
         env: &'a ProgramEnvironment<'db>,
         query: &'a dyn Fn(Type<'db>) -> U,
         recursion_guard: TypeCollector<'db>,
-        active_aliases: RefCell<Vec<(Definition<'db>, Type<'db>)>>,
+        active_aliases: RefCell<Vec<ActiveAlias<'db>>>,
+        closed_union_aliases: RefCell<FxHashSet<Type<'db>>>,
         found_matching_type: Cell<U>,
         mode: TypeSearchMode,
     }
@@ -831,41 +840,74 @@ where
         U: Copy + Default + PartialEq,
     {
         /// Visit supplied arguments outside their owner's expansion scope. Recursive references
-        /// introduced by a definition retain that scope, unless they only permute existing subterms.
-        fn visit_alias_value(
-            &self,
-            db: &'db dyn Db,
-            ty: Type<'db>,
-            definition: Definition<'db>,
-            constructor: Type<'db>,
-            arguments: Option<Specialization<'db>>,
-            value: impl FnOnce() -> Type<'db>,
-        ) {
+        /// introduced by a definition retain that scope, unless their arguments come from the
+        /// enclosing specialization or the unspecialized definition.
+        fn visit_alias_value(&self, db: &'db dyn Db, ty: Type<'db>, union: Option<UnionType<'db>>) {
+            let (definition, constructor, arguments) = match ty {
+                Type::TypeAlias(alias) => (
+                    alias.definition(db),
+                    Type::TypeAlias(alias.unspecialized(db)),
+                    alias.specialization(db),
+                ),
+                Type::Recursive(recursive) => (
+                    recursive.definition(db),
+                    Type::Recursive(recursive.constructor(db)),
+                    recursive.arguments(db),
+                ),
+                _ => return,
+            };
+            let value = |ty| match ty {
+                Type::TypeAlias(alias) => alias.value_type(db),
+                Type::Recursive(recursive) => recursive.unfold(db, self.env).into_type(),
+                _ => ty,
+            };
             let active = self.active_aliases.borrow();
             let mut scope_end = active
                 .iter()
-                .rposition(|(_, owner)| {
-                    any_over_type_including_alias_arguments(db, self.env, *owner, |nested| {
-                        nested != *owner && nested == ty
+                .rposition(|owner| {
+                    any_over_type_including_alias_arguments(db, self.env, owner.scope, |nested| {
+                        nested != owner.scope && nested == ty
                     })
                 })
                 .unwrap_or(active.len());
-            let enclosing = active[..scope_end].iter().enumerate().rev().find_map(
-                |(index, (active_definition, active))| {
-                    (*active_definition == definition).then_some((index, *active))
-                },
-            );
+            let enclosing =
+                active[..scope_end]
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(index, active)| {
+                        (active.definition == definition).then_some((index, active.alias))
+                    });
             drop(active);
             if let Some((index, enclosing)) = enclosing {
                 let reuses_arguments = arguments.is_some_and(|arguments| {
                     arguments.types(db).iter().all(|argument| {
                         any_over_type_including_alias_arguments(db, self.env, enclosing, |nested| {
                             nested != enclosing && nested == *argument
-                        })
+                        }) || {
+                            // A recursive application can also reset an argument to a constant
+                            // from its definition, as in `A[T] = tuple[T, A[object] | None]`.
+                            // Inspect the unspecialized body so this cannot admit arguments
+                            // constructed by repeated substitution, such as `list[list[T]]`.
+                            any_over_type_including_alias_arguments(
+                                db,
+                                self.env,
+                                value(constructor),
+                                |nested| nested == *argument,
+                            )
+                        }
                     })
                 });
                 if !reuses_arguments {
-                    self.visit_alias_arguments(db, constructor, arguments);
+                    if let Some(union) = union {
+                        // Other alternatives can still absorb this recursive application. Finish
+                        // normalizing them before inspecting the backedge's arguments.
+                        self.closed_union_aliases.borrow_mut().insert(ty);
+                        self.visit_union_type(db, union);
+                        self.closed_union_aliases.borrow_mut().remove(&ty);
+                    } else {
+                        self.visit_alias_arguments(db, constructor, arguments);
+                    }
                     return;
                 }
                 scope_end = index;
@@ -875,8 +917,24 @@ where
             // inspect its own `A` specialization. Definitions preceding the argument's owner
             // remain active, so nesting aliases cannot hide a growing recursive edge.
             let suspended = self.active_aliases.borrow_mut().split_off(scope_end);
-            self.active_aliases.borrow_mut().push((definition, ty));
-            self.visit_type(db, value());
+            self.active_aliases.borrow_mut().push(ActiveAlias {
+                definition,
+                alias: ty,
+                scope: union.map_or(ty, Type::Union),
+            });
+            let value = value(ty);
+            let value = union.map_or(value, |union| {
+                UnionType::from_elements_leave_aliases(
+                    db,
+                    self.env,
+                    union.elements(db).iter().map(
+                        |element| {
+                            if *element == ty { value } else { *element }
+                        },
+                    ),
+                )
+            });
+            self.visit_type(db, value);
             self.active_aliases.borrow_mut().pop();
             self.active_aliases.borrow_mut().extend(suspended);
         }
@@ -949,16 +1007,23 @@ where
             walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard);
         }
 
+        fn visit_union_type(&self, db: &'db dyn Db, union: UnionType<'db>) {
+            if matches!(self.mode, TypeSearchMode::IncludeAliasValues)
+                && let Some(alias) = union.elements(db).iter().copied().find(|element| {
+                    element.is_alias_like() && !self.closed_union_aliases.borrow().contains(element)
+                })
+            {
+                // Normalize the enclosing union before searching: `Top | T` does not depend on
+                // `T` when `Top = object`. Other operands remain outside this alias's scope.
+                self.visit_alias_value(db, alias, Some(union));
+            } else {
+                walk_union(db, union, self);
+            }
+        }
+
         fn visit_type_alias_type(&self, db: &'db dyn Db, alias: TypeAliasType<'db>) {
             if matches!(self.mode, TypeSearchMode::IncludeAliasValues) {
-                self.visit_alias_value(
-                    db,
-                    Type::TypeAlias(alias),
-                    alias.definition(db),
-                    Type::TypeAlias(alias.unspecialized(db)),
-                    alias.specialization(db),
-                    || alias.value_type(db),
-                );
+                self.visit_alias_value(db, Type::TypeAlias(alias), None);
             } else {
                 walk_type_alias_type(db, alias, self);
             }
@@ -966,14 +1031,7 @@ where
 
         fn visit_recursive_type(&self, db: &'db dyn Db, recursive: RecursiveType<'db>) {
             if matches!(self.mode, TypeSearchMode::IncludeAliasValues) {
-                self.visit_alias_value(
-                    db,
-                    Type::Recursive(recursive),
-                    recursive.definition(db),
-                    Type::Recursive(recursive.constructor(db)),
-                    recursive.arguments(db),
-                    || recursive.unfold(db, self.env).into_type(),
-                );
+                self.visit_alias_value(db, Type::Recursive(recursive), None);
             } else if self.should_visit_lazy_type_attributes() {
                 self.visit_type(db, recursive.unfold(db, self.env).into_type());
             } else {
@@ -987,6 +1045,7 @@ where
         query: &query,
         recursion_guard: TypeCollector::default(),
         active_aliases: RefCell::default(),
+        closed_union_aliases: RefCell::default(),
         found_matching_type: Cell::default(),
         mode,
     };
