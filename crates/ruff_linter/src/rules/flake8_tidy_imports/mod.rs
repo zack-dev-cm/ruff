@@ -212,6 +212,55 @@ mod tests {
         Ok(())
     }
 
+    #[test_case(PythonVersion::PY315, false; "explicit_lazy")]
+    #[test_case(PythonVersion::PY314, true; "declared_lazy_pre_py315")]
+    #[test_case(PythonVersion::PY315, true; "declared_lazy")]
+    fn preview_lazy_import_mismatch_stub(target_version: PythonVersion, declared_lazy: bool) {
+        let code = if declared_lazy {
+            dedent(
+                r#"
+                __lazy_modules__ = ["foo"]
+                import typing
+                from typing import Any
+                import foo
+                from foo import bar
+                "#,
+            )
+        } else {
+            dedent(
+                r#"
+                import typing
+                from typing import Any
+                lazy import foo
+                lazy from foo import bar
+                "#,
+            )
+        };
+        let source_kind = SourceKind::Python {
+            code: code.to_string(),
+            is_stub: true,
+        };
+        let (diagnostics, _) = test_contents(
+            &source_kind,
+            Path::new("flake8_tidy_imports/TID254.pyi"),
+            &LinterSettings {
+                flake8_tidy_imports: flake8_tidy_imports::settings::Settings {
+                    require_lazy: ImportSelector::Selection(ImportSelection::Imports(vec![
+                        "typing".to_string(),
+                    ])),
+                    ban_lazy: ImportSelector::Selection(ImportSelection::Imports(vec![
+                        "foo".to_string(),
+                    ])),
+                    ..Default::default()
+                },
+                ..LinterSettings::for_rule(Rule::LazyImportMismatch)
+                    .with_preview_mode()
+                    .with_target_version(target_version)
+            },
+        );
+        assert!(diagnostics.is_empty());
+    }
+
     #[test]
     fn preview_lazy_import_immediately_resolved() -> Result<()> {
         let diagnostics = test_path(
